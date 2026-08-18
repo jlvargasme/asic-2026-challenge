@@ -116,8 +116,9 @@ def _label_met1_nets(met1, nwell, labels=None, vdd_names=("VPWR", "VDD"), vss_na
 
 
 class NetTracer:
-    def __init__(self, labeled_regions, licon, li1, mcon, met1, nwell, labels=None):
+    def __init__(self, labeled_regions, transistors, poly, licon, li1, mcon, met1, nwell, labels=None):
         self._uf = _UnionFind()
+
         met1_net = _label_met1_nets(met1, nwell, labels=labels)
 
         diff_polys = [region for region, _ in labeled_regions]
@@ -125,12 +126,15 @@ class NetTracer:
         licon_keys = [f"licon_{i}" for i in range(len(licon))]
         li1_keys = [f"li1_{i}" for i in range(len(li1))]
         mcon_keys = [f"mcon_{i}" for i in range(len(mcon))]
+        poly_keys = [f"poly_{i}" for i in range(len(poly))]
+        transistor_keys = [t.gate_label for t in transistors]
+        transistor_poly = [t.gate for t in transistors]
         # only polygons _label_met1_nets could actually prove are VDD/VSS
         # get that shared key; everything else gets its own private node
         # (like licon/li1/mcon) so it can't be mistaken for a power net.
         met1_keys = [met1_net.get(i, f"met1_{i}") for i in range(len(met1))]
 
-        for key in diff_keys + licon_keys + li1_keys + mcon_keys + met1_keys:
+        for key in diff_keys + licon_keys + li1_keys + mcon_keys + met1_keys + poly_keys + transistor_keys:
             self._uf.find(key)  # register every node, even isolated ones
 
         def connect(polys_a, keys_a, polys_b, keys_b):
@@ -143,11 +147,13 @@ class NetTracer:
         connect(licon, licon_keys, li1, li1_keys)
         connect(li1, li1_keys, mcon, mcon_keys)
         connect(mcon, mcon_keys, met1, met1_keys)
+        connect(licon, licon_keys, poly, poly_keys)
+        connect(poly, poly_keys, transistor_poly, transistor_keys)
 
         # "labels" in the trace() sense are the diffusion labels you passed
         # in plus the two power nets -- licon/li1/mcon/unresolved-met1 are
         # just internal plumbing, not something callers referred to by name.
-        self._real_labels = set(diff_keys) | {k for k in met1_keys if k in ("VDD", "VSS")}
+        self._real_labels = set(diff_keys) | {k for k in met1_keys if k in ("VDD", "VSS")} | set(transistor_keys)
 
     def trace(self, label):
         root = self._uf.find(label)
@@ -156,13 +162,16 @@ class NetTracer:
             if other != label and self._uf.find(other) == root
         )
 
-
-def trace(label, labeled_regions, licon, li1, mcon, met1, nwell, labels=None):
-    """One-shot convenience wrapper. Rebuilds the whole connectivity graph
-    on every call -- prefer NetTracer directly if you're tracing more than
-    one label against the same geometry."""
-    return NetTracer(labeled_regions, licon, li1, mcon, met1, nwell, labels=labels).trace(label)
-
+    def find_root(self, label):
+        others = self.trace(label)
+        if len(others) == 0:
+            return label
+        elif "VSS" in others:
+           return "VSS"
+        elif "VDD" in others:
+            return "VDD"
+        else:
+            return others[0] 
 
 # if __name__ == "__main__":
 #     nwell = [gdstk.rectangle((0, 40), (40, 50))]

@@ -30,7 +30,7 @@ LAYER_STYLE = {
 }
 
 
-def plot_cell(gds_path, cell_name, out_path="layout.png", highlight_gates=True):
+def plot_cell(gds_path, cell_name, out_path="layout.png", highlight_gates=True, gate_labels=None):
     library = gdstk.read_gds(gds_path)
     cell = next((c for c in library.cells if c.name == cell_name), None)
     if cell is None:
@@ -69,6 +69,27 @@ def plot_cell(gds_path, cell_name, out_path="layout.png", highlight_gates=True):
         legend_handles.append(
             Patch(facecolor="none", edgecolor="black", hatch="//", label=f"detected gates ({result['total']})")
         )
+
+    if gate_labels:
+        # accept either Transistor objects (.gate / .gate_label) or plain
+        # (polygon, label) tuples, same convention as plot_labels().
+        items = [
+            (t.gate, t.gate_label) if hasattr(t, "gate_label") else t
+            for t in gate_labels
+        ]
+        for polygon, label in items:
+            x_min, _ = polygon.points.min(axis=0)
+            x_max, y_max = polygon.points.max(axis=0)
+            ax.annotate(
+                label,
+                ((x_min + x_max) / 2, y_max),
+                xytext=(0, 2),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+                fontweight="bold",
+            )
 
     ax.set_aspect("equal")
     ax.autoscale_view()
@@ -114,4 +135,15 @@ if __name__ == "__main__":
 
     gds_path = sys.argv[1] if len(sys.argv) > 1 else "./warmup/04_final.gds"
     cell_name = sys.argv[2] if len(sys.argv) > 2 else "sky130_fd_sc_hd__and3_2"
-    plot_cell(gds_path, cell_name)
+
+    # demonstrate gate_labels: build the Transistor list the same way
+    # tracer.py does, and plot each one's gate_label on top of its gate.
+    from build_transistor import build_transistors
+    from tracer import label_diffusion_regions, load_cell
+
+    cell = load_cell(gds_path, cell_name)
+    gates = count_transistors(gds_path, cell_name)["gates"]
+    labeled_regions = label_diffusion_regions(cell, gates)
+    transistors = build_transistors(gates, labeled_regions)
+
+    plot_cell(gds_path, cell_name, gate_labels=transistors)
