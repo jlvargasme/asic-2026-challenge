@@ -36,6 +36,7 @@ on near VGS=0, an NMOS turns on near VGS=VDD) for a functional check of
 what a cell computes, not a timing- or power-accurate simulation.
 """
 
+import numpy as np
 import z3
 from PySpice.Spice.Netlist import Circuit
 
@@ -55,6 +56,29 @@ PMOS_PARAMS = dict(level=1, vto=-0.4, kp=100e-6, lambda_=0.02)
 def _pin_net(prefix, pin_name):
     return f"{prefix}_{pin_name}"
 
+def _is_logic_cell(cell):
+    """A cell counts as logic if it has at least one functional
+    (non-power) pin -- derived purely from its own geometry, via
+    cell.input_labels/output_labels (pin.LeafCellAnalyzer.
+    classify_pin_direction traces each pin's net down to a transistor
+    gate or diffusion terminal; power/ground names are excluded before
+    either list is built), not from the cell's name.
+
+    This one check covers every non-logic reference this project's
+    example design places, for three different geometric reasons:
+      - VIA_* metal-stitching cells have no poly/diff layers at all, so
+        count_transistors() finds zero transistors and there's nothing
+        to classify a pin from.
+      - welltap cells (tapvpwrvgnd) likewise have no transistors -- they
+        exist purely to strap the substrate/well to VPWR/VGND.
+      - decap (decoupling capacitor) cells DO have transistors -- they're
+        wired as MOS capacitors, gate tied to one rail and the shorted
+        source/drain tied to the other -- but every terminal resolves to
+        a power rail, so classify_pin_direction never finds a non-power
+        pin either. Same test, same answer, without needing to know decap
+        cells contain transistors at all while VIA_* cells don't.
+    """
+    return bool(cell.input_labels or cell.output_labels)
 
 class Cell:
     """One leaf standard cell, electrically modeled from its GDS layout.
@@ -63,6 +87,7 @@ class Cell:
         gds_file: path to the .gds file.
         cell_name: name of the leaf cell inside it (e.g.
             "sky130_fd_sc_hd__and3_2").
+        cell_index: which instance of the cell to consider.
         vdd: supply voltage in volts -- used for the VDD rail and as the
             logic-1 drive level for inputs during simulate().
         logic_threshold: fraction of `vdd` above which an output node's
@@ -84,13 +109,13 @@ class Cell:
             `self._build_circuit()` again instead of cloning).
     """
 
-    def __init__(self, gds_file, cell_name, vdd=1.8, logic_threshold=0.5):
+    def __init__(self, gds_file, cell_name, cell_index=0, vdd=1.8, logic_threshold=0.5):
         self.gds_file = gds_file
         self.cell_name = cell_name
         self.vdd = vdd
         self.logic_threshold = logic_threshold
 
-        self._analyzer = LeafCellAnalyzer.for_cell(gds_file, cell_name)
+        self._analyzer = LeafCellAnalyzer.for_cell(gds_file, cell_name, cell_index)
         self.transistors = self._analyzer.transistors
 
         pin_names = sorted({
@@ -302,6 +327,97 @@ class Cell:
                 raise ValueError(f"inputs {given} make this cell's switch network unsatisfiable")
         return outputs
 
+    def simulate_transient(self, events, probe_times, edge_time=1e-10, step_time=None, end_time=None):
+        """Run a real SPICE transient simulation -- inputs stepped through
+        a sequence of values over actual time -- and sample this cell's
+        output(s) at specific times.
+
+        simulate()/simulate_z3() are both single fixed-input snapshots
+        with no notion of history, which is fine for a combinational
+        gate but can't exercise what a stateful cell (a flip-flop's clock
+        edge, hold behavior, asynchronous reset) actually depends on --
+        this can, because it's a real time-domain simulation rather than
+        an operating point or a static switch model.
+
+        Args:
+            events: list of (time, {input_label: 0/1, ...}) tuples, in
+                increasing time order, first time == 0. Each dict gives
+                ALL of self.input_labels' values from that time onward --
+                a step change, ramped over `edge_time` seconds so the
+                solver has a real (if fast) edge to resolve rather than
+                an instant jump. Consecutive event times should be spaced
+                well apart relative to `edge_time`.
+            probe_times: times (seconds) at which to sample
+                self.output_labels -- pick these a bit after whichever
+                edge they're meant to observe the settled result of, not
+                exactly on top of it.
+            edge_time: ramp duration for each step change (seconds).
+                This isn't just a numerical-convergence knob -- too fast
+                an edge can produce genuinely WRONG digital behavior, not
+                just a solver warning, for any cell with an internal
+                timing race (e.g. a flip-flop's master/slave latch
+                handoff assumes the clock and its internal complement
+                settle in the right relative order; an edge fast enough
+                to violate that can make the wrong internal transmission
+                gate open first, capturing data on the wrong edge). Pick
+                this slow relative to the cell's own internal switching
+                speed, not just "fast enough to finish quickly" -- 1e-10
+                is fine for simple combinational probing, but a
+                sequential cell may need something like 1e-9 or slower;
+                if a transient result looks wrong, try slowing the edge
+                down before assuming it's an extraction bug.
+            step_time, end_time: passed to the ngspice transient analysis;
+                default to edge_time/100 and one edge_time past the last
+                of probe_times/event times if not given. step_time isn't
+                just a solver-speed knob either: at edge_time/10 (tried
+                first), probing a settled plateau could land on a
+                reported point ngspice had interpolated right across a
+                transition rather than a genuinely representative sample
+                of the held value -- wrong enough to look exactly like a
+                real circuit bug (a spurious capture on the wrong clock
+                edge) until traced back to sampling resolution instead.
+
+        Returns:
+            list of (list of 0/1, one per self.output_labels), one entry
+            per `probe_times`, in that order.
+        """
+        if not events or events[0][0] != 0:
+            raise ValueError("events must be non-empty and start at time 0")
+        for t, values in events:
+            missing = [label for label in self.input_labels if label not in values]
+            if missing:
+                raise ValueError(f"event at time {t} doesn't specify a value for input(s) {missing}")
+
+        circuit = self._build_circuit()
+        circuit.V("dd_supply", "VDD", GROUND, self.vdd)
+
+        for label in self.input_labels:
+            points = []
+            prev_level = None
+            for t, values in events:
+                level = self.vdd if values[label] else 0.0
+                if prev_level is not None and level != prev_level:
+                    points.append((max(t - edge_time, points[-1][0]), prev_level))
+                points.append((t, level))
+                prev_level = level
+            circuit.PieceWiseLinearVoltageSource(f"in_{label}", _pin_net("in", label), GROUND, values=points)
+
+        end_time = end_time or max(events[-1][0], max(probe_times)) + edge_time
+        step_time = step_time or edge_time / 100
+
+        simulator = circuit.simulator(temperature=25, nominal_temperature=25)
+        analysis = simulator.transient(step_time=step_time, end_time=end_time)
+        time = np.array(analysis.time)
+
+        results = []
+        for probe in probe_times:
+            idx = int(np.abs(time - probe).argmin())
+            results.append([
+                int(float(analysis[_pin_net("out", label)][idx]) >= self.vdd * self.logic_threshold)
+                for label in self.output_labels
+            ])
+        return results
+
     def find_inputs_for_output(self, target=1, output_label=None):
         """Find every input combination that makes one output pin equal
         `target`, via z3 SAT enumeration rather than brute-force
@@ -348,18 +464,49 @@ if __name__ == "__main__":
     import sys
 
     gds_file = sys.argv[1] if len(sys.argv) > 1 else "./warmup/04_final.gds"
+    # sky130_fd_sc_hd__and4bb_2
     cell_name = sys.argv[2] if len(sys.argv) > 2 else "sky130_fd_sc_hd__and3_2"
+    cell_index = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 
-    cell = Cell(gds_file, cell_name)
+    cell = Cell(gds_file, cell_name, cell_index)
     print(f"{cell_name}: inputs={cell.input_labels} outputs={cell.output_labels}")
 
-    from itertools import product
-    print("PySpice simulation:")
-    for combo in product((0, 1), repeat=len(cell.input_labels)):
-        print(f"  {dict(zip(cell.input_labels, combo))} -> {cell.simulate(combo)}")
+    # deferred: only needed for this CLI demo, and test_suite.py itself
+    # imports Cell from this module, so importing it at module level
+    # here would be circular.
+    import test_suite
 
-    print("Z3 simulation:")
-    for combo in product((0, 1), repeat=len(cell.input_labels)):
-        print(f"  {dict(zip(cell.input_labels, combo))} -> {cell.simulate_z3(combo)}")
+    if not _is_logic_cell(cell):
+        print("Non-logic cell, skipping simulation")
+    elif cell_name in test_suite.SEQUENTIAL_TESTS:
+        # simulate()/simulate_z3() are both single fixed-input snapshots
+        # with no notion of "previous state" -- fine for combinational
+        # logic, but for a cell like this one they either read back
+        # whatever operating point ngspice's solver happened to settle
+        # into (simulate()) or hit simulate_z3()'s own "isn't uniquely
+        # determined" guard (its ideal-switch model has no way to
+        # represent history at all). test_suite.py's sequential test
+        # exercises this properly instead -- a real transient simulation
+        # with actual clock edges over time, checked against this cell's
+        # documented behavior (reset, edge-triggered capture, hold).
+        events, expectations, edge_time = test_suite.SEQUENTIAL_TESTS[cell_name]
+        print("Sequential (transient) test:")
+        ok, failures = test_suite.run_sequential_test(cell, events, expectations, edge_time=edge_time)
+        if ok:
+            print(f"  PASS  ({len(expectations)}/{len(expectations)} probe(s) matched)")
+        else:
+            print(f"  FAIL  ({len(expectations) - len(failures)}/{len(expectations)} probe(s) matched)")
+            for t, description, expected, actual in failures:
+                print(f"    t={t * 1e9:.0f}ns  {description}")
+                print(f"      expected={expected}  actual={actual}")
+    else:
+        from itertools import product
+        print("PySpice simulation:")
+        for combo in product((0, 1), repeat=len(cell.input_labels)):
+            print(f"  {dict(zip(cell.input_labels, combo))} -> {cell.simulate(combo)}")
 
-    print(f"Search for inputs that satisfy the gate: -> {cell.z3_inputs}:{cell.find_inputs_for_output()}")
+        print("Z3 simulation:")
+        for combo in product((0, 1), repeat=len(cell.input_labels)):
+            print(f"  {dict(zip(cell.input_labels, combo))} -> {cell.simulate_z3(combo)}")
+
+        print(f"Search for inputs that satisfy the gate: -> {cell.z3_inputs}:{cell.find_inputs_for_output()}")

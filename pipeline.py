@@ -79,6 +79,10 @@ def main():
     print("transistors renamed:")
     renamed = []
     for t in transistors:
+        if None in (t.source_label, t.drain_label):
+            print(f"warning: skipping transistor {t.gate_label} with incomplete terminals "
+                  f"(kind={t.kind}, source={t.source_label}, drain={t.drain_label})")
+            continue
         gate = _pin_display(gds_file, cell.name, t.gate_label)
         source = _pin_display(gds_file, cell.name, tracer.find_root(t.source_label))
         drain = _pin_display(gds_file, cell.name, tracer.find_root(t.drain_label))

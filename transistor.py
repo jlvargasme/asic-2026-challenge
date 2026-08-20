@@ -293,10 +293,12 @@ def transistor_to_z3(transistor, gate_var, source_var, drain_var):
 
 # python ./transistor.py ./warmup/04_final.gds sky130_fd_sc_hd__and3_2
 if __name__ == "__main__":
+    import sys
     from gds_utils import label_diffusion_regions, load_cell
 
-    gds_file = "./warmup/04_final.gds"
-    cell_name = "sky130_fd_sc_hd__and3_2"
+    gds_file = sys.argv[1] if len(sys.argv) > 1 else "./warmup/04_final.gds"
+    # sky130_fd_sc_hd__and4bb_2
+    cell_name = sys.argv[2] if len(sys.argv) > 2 else "sky130_fd_sc_hd__and3_2"
 
     result = count_transistors(gds_file, cell_name)
     cell = load_cell(gds_file, cell_name)

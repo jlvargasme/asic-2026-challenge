@@ -57,3 +57,40 @@ def _extends_beyond(poly, footprint, precision=1e-3):
     """True if `poly` has area sticking out past `footprint`."""
     outside = gdstk.boolean(poly, footprint, "not", precision=precision)
     return sum(p.area() for p in outside) > 0
+
+
+def _split_pinched(polygons, epsilon=1e-4, precision=1e-6):
+    """Split any polygon in `polygons` that is really several disjoint
+    pieces joined by zero-width "pinch" bridges into its true separate
+    pieces.
+
+    gdstk.boolean's underlying clipping engine can represent what is
+    electrically several disjoint regions as a SINGLE polygon record --
+    e.g. subtracting two nearby gate cuts from one diffusion strip can
+    come back as one comb-shaped polygon whose "teeth" meet the opposite
+    edge exactly, joined only by a zero-width bridge, rather than as
+    separate polygons for each tooth. This isn't a precision artifact
+    (confirmed empirically: unaffected by the boolean's own `precision`
+    argument, across a 1e-3 to 1e-9 sweep) -- it's just how the underlying
+    engine chooses to report a multiply-connected result.
+
+    A zero-width bridge can't survive being eroded at all, no matter how
+    small the erosion -- so shrinking each polygon by `epsilon` (a
+    negative offset) severs any such bridge and leaves the true disjoint
+    pieces behind, each still (approximately) its own shape. Growing them
+    back by the same `epsilon` restores each piece's original size --
+    exactly, for the axis-aligned/Manhattan geometry this project already
+    assumes elsewhere (see transistor.py's module docstring), since a
+    miter join preserves right-angle corners exactly.
+
+    A polygon that was never pinched eroded-then-dilated only produces
+    that one polygon back, so this is safe to apply broadly.
+    """
+    result = []
+    for p in polygons:
+        eroded = gdstk.offset([p], -epsilon, join="miter", precision=precision)
+        if len(eroded) <= 1:
+            result.append(p)
+            continue
+        result.extend(gdstk.offset(eroded, epsilon, join="miter", precision=precision))
+    return result

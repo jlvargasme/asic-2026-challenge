@@ -228,18 +228,23 @@ class LeafCellAnalyzer:
     lookup tables of its own local li1/met1 polygons so a pin label's XY
     point can be mapped to a union-find node.
 
-    Cached per (gds_path, leaf_cell_name) via `for_cell()` -- a leaf cell's
-    own layout never depends on where it's placed, so every instance of the
-    same cell type reuses one analyzer instead of rebuilding the graph.
+    Cached per (gds_path, leaf_cell_name, leaf_cell_index) via `for_cell()`
+    -- a leaf cell's own layout never depends on where it's placed, so
+    every instance of the same cell type reuses one analyzer instead of
+    rebuilding the graph. leaf_cell_index is part of the cache key too,
+    not just load_cell()'s own lookup, since two different indices name
+    two different (if same-named) cell definitions -- see
+    gds_utils.load_cell()'s docstring.
     """
 
     _cache = {}
 
-    def __init__(self, gds_path, leaf_cell_name):
+    def __init__(self, gds_path, leaf_cell_name, leaf_cell_index=0):
         self.gds_path = gds_path
         self.leaf_cell_name = leaf_cell_name
+        self.leaf_cell_index = leaf_cell_index
 
-        cell = load_cell(gds_path, leaf_cell_name)
+        cell = load_cell(gds_path, leaf_cell_name, leaf_cell_index)
         gates = count_transistors(gds_path, leaf_cell_name)["gates"]
         labeled_regions = label_diffusion_regions(cell, gates)
         transistors = build_transistors(gates, labeled_regions)
@@ -258,10 +263,10 @@ class LeafCellAnalyzer:
         self._met1 = list(zip(met1, [f"met1_{i}" for i in range(len(met1))]))
 
     @classmethod
-    def for_cell(cls, gds_path, leaf_cell_name):
-        key = (gds_path, leaf_cell_name)
+    def for_cell(cls, gds_path, leaf_cell_name, leaf_cell_index=0):
+        key = (gds_path, leaf_cell_name, leaf_cell_index)
         if key not in cls._cache:
-            cls._cache[key] = cls(gds_path, leaf_cell_name)
+            cls._cache[key] = cls(gds_path, leaf_cell_name, leaf_cell_index)
         return cls._cache[key]
 
     def classify_pin_direction(self, pin_name, texttype=5):
