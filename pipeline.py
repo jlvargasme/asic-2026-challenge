@@ -21,11 +21,27 @@ from transistor import build_transistors, count_transistors
 
 
 def _pin_display(gds_file, cell_name, label):
-    """"in_A" / "out_X" if `label`'s net is one of the cell's own named
-    pins (per LeafCellAnalyzer.classify_pin_direction), else `label` itself
-    unchanged -- most gate/source/drain labels are internal nodes with no
-    external pin of their own, and should keep showing as "GP_3"/"DN_2"."""
+    """"VDD"/"VSS" if `label`'s net is tied to a supply rail, "in_A" /
+    "out_X" if it's one of the cell's own named pins (per
+    LeafCellAnalyzer.classify_pin_direction), else `label` itself unchanged
+    -- most gate/source/drain labels are internal nodes with no external
+    pin of their own, and should keep showing as "GP_3"/"DN_2".
+
+    Checks VDD/VSS before pin_name_for_net() because pin_name_for_net()
+    deliberately excludes power-rail labels from its "named pin" search
+    (see pin.py's `exclude` default) -- without this check, a gate tied
+    straight to a rail (e.g. a decap cell's MOS-capacitor wiring) would
+    fall through to the raw internal label instead of "VDD"/"VSS", exactly
+    like cell.py's Cell._net_name() has to guard against.
+    """
     analyzer = LeafCellAnalyzer.for_cell(gds_file, cell_name)
+    uf = analyzer.tracer._uf
+    net_key = uf.find(label)
+    if net_key == uf.find("VSS"):
+        return "VSS"
+    if net_key == uf.find("VDD"):
+        return "VDD"
+
     pin_name, direction = analyzer.pin_name_for_net(label)
     if pin_name is None:
         return label

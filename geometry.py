@@ -9,6 +9,38 @@ import gdstk
 
 TOL = 1e-6
 
+# sky130's routing stack, contact/via by contact/via: two shapes on one of
+# these ADJACENT (name_a, name_b) layer pairs can be electrically connected
+# by a real via/contact if their footprints overlap. This is the single
+# canonical definition of that adjacency -- net_trace.py (one leaf cell's
+# poly/li1/met1/licon/mcon graph), pin.py (one placed instance's own
+# li1..met2 pin-detection graph), and chip.py (the full chip's li1..met5
+# routing graph) all import it rather than keeping their own copies, so a
+# layer added or renamed here doesn't need to be kept in sync by hand in
+# three places. A caller that only uses a subset of these layers (e.g.
+# pin.py never builds met3+ shapes) simply never generates candidate pairs
+# for the unused entries -- carrying the full stack's pairs is harmless.
+#
+# This is NOT sufficient on its own to reconstruct a net graph: two shapes
+# on the SAME layer that overlap or abut are just as electrically connected
+# as two shapes on adjacent layers linked by a via (see _touching's
+# docstring for why -- sky130 routinely draws one physical wire as several
+# same-layer polygons). Same-layer self-connection has to be handled
+# separately by each caller, since whether it's warranted depends on that
+# caller's own layer set.
+ADJACENT_LAYER_PAIRS = {
+    ("li1", "mcon"),
+    ("mcon", "met1"),
+    ("met1", "via1"),
+    ("via1", "met2"),
+    ("met2", "via2"),
+    ("via2", "met3"),
+    ("met3", "via3"),
+    ("via3", "met4"),
+    ("met4", "via4"),
+    ("via4", "met5"),
+}
+
 
 def _edges(polygon):
     pts = polygon.points
@@ -47,6 +79,27 @@ def _touching_regions(gate, labeled_regions):
             matches.append((label, centroid))
     matches.sort(key=lambda m: (m[1][0], m[1][1]))
     return matches
+
+
+def _touching(poly_a, poly_b):
+    """True if `poly_a` and `poly_b` share a collinear, overlapping edge
+    segment -- i.e. they abut, even if their areas don't overlap at all.
+    Same technique transistor.py's build_transistors() uses to match a
+    gate to the diffusion it touches (via _touching_regions above).
+
+    Needed alongside _overlaps() wherever same-layer shapes are unioned
+    together: sky130 sometimes draws one physical net as more than one
+    polygon record on the same layer, and the two records can meet either
+    by area-overlapping OR by abutting edge-to-edge with zero area overlap
+    (e.g. a poly gate shared by a PMOS row and an NMOS row is drawn as one
+    rectangle per row, meeting exactly where the rows meet). Either
+    failure mode -- a missed edge-touch, or a same-layer overlap nobody
+    checked -- leaves part of a net with no way back to the rest of it, so
+    callers doing same-layer self-connection (net_trace.py's
+    connect_self(), chip.py's _build_net_graph(), pin.py's
+    find_instance_pins()) all check both _overlaps() OR _touching()."""
+    edges_a, edges_b = _edges(poly_a), _edges(poly_b)
+    return any(_segments_overlap(ea, eb) for ea in edges_a for eb in edges_b)
 
 
 def _overlaps(poly_a, poly_b, precision=1e-3):

@@ -75,18 +75,8 @@ for anything but a one-off query.
 
 import gdstk
 
-from geometry import _edges, _overlaps, _segments_overlap
+from geometry import _overlaps, _touching
 from union_find import UnionFind
-
-
-def _touching(poly_a, poly_b):
-    """True if `poly_a` and `poly_b` share a collinear, overlapping edge
-    segment -- i.e. they abut, even if their areas don't overlap at all.
-    Same technique transistor.py's build_transistors() uses to match a
-    gate to the diffusion it touches; see this module's docstring for why
-    poly specifically needs this in addition to area-overlap."""
-    edges_a, edges_b = _edges(poly_a), _edges(poly_b)
-    return any(_segments_overlap(ea, eb) for ea in edges_a for eb in edges_b)
 
 
 def _label_met1_nets(met1, nwell, labels=None, vdd_names=("VPWR", "VDD"), vss_names=("VGND", "VSS", "GND")):

@@ -54,7 +54,7 @@ recomputed per instance.
 
 import gdstk
 
-from geometry import _extends_beyond, _overlaps
+from geometry import ADJACENT_LAYER_PAIRS, _extends_beyond, _overlaps, _touching
 from gds_utils import SKY130, label_diffusion_regions, load_cell
 from net_trace import NetTracer
 from transistor import build_transistors, count_transistors
@@ -78,14 +78,6 @@ DEFAULT_LAYERS = {
     "via1": (68, 44),
     "met2": (69, 20),
     "via2": (69, 44),
-}
-# only physically-adjacent layer pairs can belong to the same net
-ADJACENT_LAYER_PAIRS = {
-    ("li1", "mcon"),
-    ("mcon", "met1"),
-    ("met1", "via1"),
-    ("via1", "met2"),
-    ("met2", "via2"),
 }
 
 
@@ -151,10 +143,18 @@ def find_instance_pins(
     if not seeds:
         return []
 
-    # union-find same-net grouping, but only across physically adjacent
-    # layers (met1 can touch via1, via1 can touch met2, etc. -- met1
-    # touching met2 directly would be a different, unrelated coincidence,
-    # not a real via connection)
+    # union-find same-net grouping: a cross-layer pair only merges across
+    # geometry.ADJACENT_LAYER_PAIRS (met1 can touch via1, via1 can touch
+    # met2, etc. -- met1 touching met2 directly would be a different,
+    # unrelated coincidence, not a real via connection), and only on area
+    # overlap (a via/contact is a real 2D square). A same-layer pair merges
+    # on overlap OR edge-touch instead -- sky130 routinely draws one
+    # physical wire as several abutting/overlapping same-layer polygons,
+    # and nothing in a purely cross-layer adjacency chain would ever
+    # reunite two such records with each other (see net_trace.py's module
+    # docstring and chip.py's _build_net_graph() for this exact failure
+    # mode found and fixed at the leaf-cell and chip-wide scopes -- this is
+    # the same fix for find_instance_pins()'s own per-instance graph).
     uf = UnionFind()
     keys = [f"{name}_{i}" for i, (name, _) in enumerate(seeds)]
     for k in keys:
@@ -164,9 +164,15 @@ def find_instance_pins(
         layer_a, poly_a = seeds[a]
         for b in range(a + 1, len(seeds)):
             layer_b, poly_b = seeds[b]
-            if (layer_a, layer_b) not in ADJACENT_LAYER_PAIRS and (layer_b, layer_a) not in ADJACENT_LAYER_PAIRS:
+
+            if layer_a == layer_b:
+                connected = _overlaps(poly_a, poly_b) or _touching(poly_a, poly_b)
+            elif (layer_a, layer_b) in ADJACENT_LAYER_PAIRS or (layer_b, layer_a) in ADJACENT_LAYER_PAIRS:
+                connected = _overlaps(poly_a, poly_b)
+            else:
                 continue
-            if _overlaps(poly_a, poly_b):
+
+            if connected:
                 uf.union(keys[a], keys[b])
 
     groups = {}

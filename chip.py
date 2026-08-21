@@ -50,7 +50,7 @@ import gdstk
 
 from cell import Cell, _is_logic_cell
 from gds_utils import SKY130, load_cell
-from geometry import _overlaps
+from geometry import ADJACENT_LAYER_PAIRS, _overlaps, _touching
 from union_find import UnionFind
 
 PIN_TEXTTYPE = 5
@@ -71,18 +71,6 @@ ROUTING_LAYERS = {
     "met4": (71, 20),
     "via4": (71, 44),
     "met5": (72, 20),
-}
-ADJACENT_ROUTING_LAYER_PAIRS = {
-    ("li1", "mcon"),
-    ("mcon", "met1"),
-    ("met1", "via1"),
-    ("via1", "met2"),
-    ("met2", "via2"),
-    ("via2", "met3"),
-    ("met3", "via3"),
-    ("via3", "met4"),
-    ("met4", "via4"),
-    ("via4", "met5"),
 }
 
 class _SpatialGrid:
@@ -220,6 +208,29 @@ class Chip:
         self.levels, self.unresolved = self._levelize()
 
     def _build_net_graph(self):
+        """Union-find over every routing shape in the top cell.
+
+        A same-layer pair is unioned on overlap OR edge-touch; a
+        cross-layer pair only if it's one of geometry.ADJACENT_LAYER_PAIRS,
+        and only on overlap (a via/contact is a real 2D square that must
+        overlap both the layer above and below it -- two layers merely
+        touching edge-to-edge isn't a via). Same-layer self-connection is
+        not an optional extra: sky130 routinely draws one physical wire as
+        several abutting or overlapping same-layer polygons (e.g. multiple
+        rectangles stitched together at a bend, or a routing tool emitting
+        overlapping segments for one net), and nothing in a purely
+        cross-layer adjacency chain ever reunites two same-layer records
+        with each other. Without this, such a net silently splits into
+        multiple disconnected union-find groups -- found in practice on
+        warmup/04_final.gds, where a DFF's Q output (labeled net) and an
+        AND gate's A input (also labeled) turned out to be the same
+        physical met1 wire, split into 3 separate groups by exactly this
+        gap, leaving the AND gate's input looking like an undriven,
+        neighborless net. net_trace.py's NetTracer already had to solve
+        this identical problem for one leaf cell's own poly/li1/met1 (see
+        its module docstring and connect_self()) -- this is the same fix,
+        applied to the chip-wide routing graph instead.
+        """
         layer_polys = {
             name: self.top_cell.get_polygons(depth=None, layer=lay[0], datatype=lay[1])
             for name, lay in ROUTING_LAYERS.items()
@@ -238,9 +249,15 @@ class Chip:
         for i, j in grid.candidate_pairs():
             key_a, layer_a, poly_a = shapes[i]
             key_b, layer_b, poly_b = shapes[j]
-            if (layer_a, layer_b) not in ADJACENT_ROUTING_LAYER_PAIRS and (layer_b, layer_a) not in ADJACENT_ROUTING_LAYER_PAIRS:
+
+            if layer_a == layer_b:
+                connected = _overlaps(poly_a, poly_b) or _touching(poly_a, poly_b)
+            elif (layer_a, layer_b) in ADJACENT_LAYER_PAIRS or (layer_b, layer_a) in ADJACENT_LAYER_PAIRS:
+                connected = _overlaps(poly_a, poly_b)
+            else:
                 continue
-            if _overlaps(poly_a, poly_b):
+
+            if connected:
                 uf.union(key_a, key_b)
 
         return uf, shapes, grid
