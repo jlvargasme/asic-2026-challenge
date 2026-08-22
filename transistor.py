@@ -207,7 +207,7 @@ def _gate_dimensions(transistor):
 
 def transistor_to_pyspice(circuit, transistor, gate_net, source_net, drain_net,
                            bulk_net=None, nmos_model="NMOS", pmos_model="PMOS",
-                           length=150e-9, width=420e-9):
+                           length=150e-9, width=420e-9, name=None):
     """Add one MOSFET element to a PySpice `circuit` for `transistor`.
 
     A Transistor's own gate_label/source_label/drain_label are internal
@@ -233,6 +233,17 @@ def transistor_to_pyspice(circuit, transistor, gate_net, source_net, drain_net,
         length, width: fallback channel length/width in meters, used only
             when `transistor.gate` is unavailable; otherwise both are
             derived from the gate polygon's own bounding box.
+        name: element name PySpice registers this MOSFET under within
+            `circuit`. Defaults to transistor.gate_label, which is fine
+            for a single cell's own circuit (cell.Cell._build_circuit),
+            but transistor.gate_label is only unique WITHIN one leaf
+            cell's own transistor list (e.g. "GP_0") -- a circuit
+            combining transistors from several placed instances of the
+            same leaf cell type (clustering.py's
+            build_cluster_pyspice_circuit) needs the caller to pass an
+            instance-qualified name instead, or PySpice raises
+            "Element name ... is already defined" the moment a second
+            instance of that cell type adds its own "GP_0".
 
     Returns:
         The PySpice Mosfet element that was added to `circuit`.
@@ -249,7 +260,7 @@ def transistor_to_pyspice(circuit, transistor, gate_net, source_net, drain_net,
         length, width = dims
 
     return circuit.MOSFET(
-        transistor.gate_label,
+        name if name is not None else transistor.gate_label,
         drain_net, gate_net, source_net, bulk_net or default_bulk,
         model=model, l=length, w=width,
     )

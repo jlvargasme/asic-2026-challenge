@@ -135,6 +135,20 @@ class _SpatialGrid:
         """Indices of shapes registered in the same grid cell as (x, y)."""
         return self.buckets.get(self._cell(x, y), [])
 
+    def near_box(self, x0, y0, x1, y1):
+        """Indices of shapes registered in any grid cell (x0, y0)-(x1, y1)
+        touches -- the bounding-box analogue of near(), for matching a
+        whole polygon (e.g. one pin's transformed routing shape) instead
+        of a single point."""
+        seen = set()
+        result = []
+        for cell in self._cell_range(x0, y0, x1, y1):
+            for i in self.buckets.get(cell, []):
+                if i not in seen:
+                    seen.add(i)
+                    result.append(i)
+        return result
+
 
 class Instance:
     """One placed standard-cell logic instance inside a Chip.
@@ -200,7 +214,7 @@ class Chip:
         self.labels = self.top_cell.get_labels(depth=None)
 
         self._uf, self._shapes, self._grid = self._build_net_graph()
-        self._label_root, self._root_labels = self._index_labels()
+        self._root_labels = self._index_labels()
         self._net_names = {}
         self._used_names = set()
 
@@ -263,13 +277,19 @@ class Chip:
         return uf, shapes, grid
 
     def _index_labels(self):
-        """Precompute, once via the spatial grid, which chip-wide net
-        (union-find root) each texttype-5 label sits on -- both as
-        {label: root} (used to resolve one instance's own local pin
-        labels without a second grid search) and {root: {label texts}}
-        (used to name a net from whatever label(s) it has, in _net_name).
+        """Precompute, once via the spatial grid, {root: {label texts}} --
+        which chip-wide net (union-find root) each texttype-5 label sits
+        on, used only to name a net from whatever label(s) it has (see
+        _net_name) if one exists. Purely cosmetic: _net_name() already
+        falls back to a synthetic "net"/"net#1"/... name when a root has
+        no label at all, so a design with few or no top-level labels (the
+        actual reverse-engineering case -- see chip.Instance.global_pins'
+        docstring) still gets a distinct, stable name per net, just not a
+        human-meaningful one. This is NOT used to determine which
+        instances share a net -- that's Chip._net_root_for_polygon(),
+        purely geometric -- only to decide what to print for one once it's
+        already been found.
         """
-        label_root = {}
         root_labels = defaultdict(set)
         for lbl in self.labels:
             if lbl.texttype != PIN_TEXTTYPE:
@@ -278,11 +298,9 @@ class Chip:
             for i in self._grid.near(x, y):
                 key, _, poly = self._shapes[i]
                 if gdstk.inside([lbl.origin], [poly])[0]:
-                    root = self._uf.find(key)
-                    label_root[lbl] = root
-                    root_labels[root].add(lbl.text)
+                    root_labels[self._uf.find(key)].add(lbl.text)
                     break
-        return label_root, root_labels
+        return root_labels
 
     def _net_name(self, root):
         """Resolve a net-graph union-find root to a global net name: a
@@ -317,22 +335,74 @@ class Chip:
         self._net_names[root] = name
         return name
 
-    def _instance_global_pins(self, reference, cell):
-        footprint_box = reference.bounding_box()
-        if footprint_box is None:
-            return {}
-        (fx0, fy0), (fx1, fy1) = footprint_box
+    def _net_root_for_polygon(self, poly):
+        """Chip-wide union-find root for whatever routing shape `poly`
+        (already transformed into chip/global coordinates) overlaps, or
+        None if it doesn't overlap anything registered in the chip-wide
+        routing graph. Purely geometric -- the replacement for looking up
+        a per-instance net label at this same spot."""
+        (x0, y0), (x1, y1) = poly.bounding_box()
+        for i in self._grid.near_box(x0, y0, x1, y1):
+            key, _, shape = self._shapes[i]
+            if _overlaps(poly, shape):
+                return self._uf.find(key)
+        return None
 
-        pin_names = set(cell.input_labels) | set(cell.output_labels)
+    def _instance_global_pins(self, reference, cell):
+        """{local_pin_name: global_net_name} for every one of `cell`'s own
+        named pins this instance's *placement* actually connects to a
+        chip-wide net.
+
+        Deliberately does NOT look for a per-instance net/pin label
+        stamped at this placement (the way an earlier version of this
+        method did, and the way pin.py's find_instance_pins() still does)
+        -- that label is the routed DESIGN's own naming for this specific
+        net, exactly the kind of internal name a "final manufacturable"
+        GDS is meant to have stripped (see this project's own README on
+        warmup/04_final.gds vs. the earlier flow stages), and exactly what
+        a reverse engineer isn't supposed to get to read off directly.
+
+        Instead: `cell._analyzer.pin_local_polygons(pin_name)` gives this
+        pin's own routing shape(s) in the LEAF CELL's local coordinate
+        system -- derived from the *standard cell library's* own internal
+        labels (see LeafCellAnalyzer's docstring for why that's a
+        different, non-secret category of label: PDK/library data true
+        for every design built from this cell, not this specific circuit's
+        own net naming). Each candidate polygon is transformed through
+        this instance's own placement (origin/rotation/reflection --
+        exactly what turns a leaf cell's local geometry into this
+        instance's actual position on the die) and matched directly
+        against the chip-wide routing graph via _net_root_for_polygon --
+        so two instances' pins land on the same global net because their
+        *routing shapes actually geometrically connect*, never because
+        they happen to share a label.
+        """
         global_pins = {}
-        for lbl in self.labels:
-            if lbl.texttype != PIN_TEXTTYPE or lbl.text not in pin_names:
-                continue
-            if not (fx0 <= lbl.origin[0] <= fx1 and fy0 <= lbl.origin[1] <= fy1):
-                continue
-            root = self._label_root.get(lbl)
+        # sorted(), not a bare set union: iteration order here feeds
+        # _net_name()'s "first root seen claims the plain base name, later
+        # ones get #1/#2/..." suffix assignment, and Python's set iteration
+        # order for strings is randomized per-process (PYTHONHASHSEED) --
+        # without this, which arbitrary suffix a given net ends up with
+        # would vary between runs of the exact same GDS.
+        for pin_name in sorted(set(cell.input_labels) | set(cell.output_labels)):
+            root = None
+            for local_poly in cell._analyzer.pin_local_polygons(pin_name):
+                # .copy() first: .transform() mutates in place, and
+                # local_poly is a shape owned by the (cached, shared-
+                # across-every-instance-of-this-cell-type) LeafCellAnalyzer
+                # -- transforming it directly would corrupt every other
+                # instance's own view of this same leaf cell.
+                global_poly = local_poly.copy().transform(
+                    magnification=reference.magnification,
+                    x_reflection=reference.x_reflection,
+                    rotation=reference.rotation,
+                    translation=reference.origin,
+                )
+                root = self._net_root_for_polygon(global_poly)
+                if root is not None:
+                    break
             if root is not None:
-                global_pins[lbl.text] = self._net_name(root)
+                global_pins[pin_name] = self._net_name(root)
         return global_pins
 
     def _build_instances(self):

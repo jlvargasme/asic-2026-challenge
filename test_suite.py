@@ -44,6 +44,23 @@ active-high reset, positive- vs negative-edge, synchronous vs
 asynchronous) isn't something geometry alone determines -- it has to be
 checked against a spec for that specific cell, the same way any datasheet
 based hardware test would be.
+
+CHIP_TESTS below is the same idea one level up: cross-validating
+clustering.py's cluster/chip-level z3 and PySpice machinery (built on top
+of chip.py's Chip and clustering.py's Cluster) against warmup/00_source.v's
+KNOWN RTL structure (2 shift registers, an 8-bit adder, and comparator496)
+instead of a single leaf cell's datasheet. Locating "the comparator
+cluster" or "a shift register's own CLK/RESET_B/EN/serial-in nets" within
+these tests uses each instance's own KNOWN library cell name and pin names
+(e.g. "this is a sky130_fd_sc_hd__dfrtp_2, and its RESET_B pin's net is
+the reset net") -- the same kind of test-fixture-specific, PDK-level
+knowledge SEQUENTIAL_TESTS above already uses to key by cell name, not
+something clustering.py's own (deliberately label-free) analysis logic
+depends on. See clustering.py's module docstring for the full account of
+why that analysis works the way it does, including a bounded-model-
+checking attempt at modeling a flip-flop directly in z3 that failed on
+this exact cell's real, area-optimized transistor-shared layout, and the
+PySpice-based hybrid these tests actually validate instead.
 """
 
 import sys
@@ -52,6 +69,14 @@ from itertools import product
 import gdstk
 
 from cell import Cell
+from chip import Chip
+from clustering import (
+    cluster_chip,
+    cluster_io_nets,
+    find_chip_inputs_for_output,
+    find_cluster_inputs_for_output,
+    simulate_cluster_transient,
+)
 
 MAX_INPUTS = 10  # 2**10 = 1024 combinations; guards against a pathological cell
 
@@ -105,6 +130,215 @@ _DFRTP_2_EXPECTATIONS = [
 SEQUENTIAL_TESTS = {
     "sky130_fd_sc_hd__dfrtp_2": (_DFRTP_2_EVENTS, _DFRTP_2_EXPECTATIONS, _DFRTP_2_EDGE),
 }
+
+
+def _find_comparator_cluster(clusters):
+    """The cluster matching comparator496's known gate composition (1
+    and3_2 + 2 and4bb_2, nothing else -- see warmup/00_source.v) -- or
+    None if no cluster matches (e.g. run against a different design)."""
+    for c in clusters:
+        counts = c.cell_type_counts
+        if c.size == 3 and counts.get("sky130_fd_sc_hd__and3_2") == 1 and counts.get("sky130_fd_sc_hd__and4bb_2") == 2:
+            return c
+    return None
+
+
+def _find_shift_register_clusters(clusters):
+    """Every cluster shaped like one of adder_demo's two 8-bit shift
+    registers (exactly 8 dfrtp_2 instances)."""
+    return [c for c in clusters if c.cell_type_counts.get("sky130_fd_sc_hd__dfrtp_2") == 8]
+
+
+def _find_shift_register_nets(cluster):
+    """Structurally locate one shift-register-shaped cluster's own
+    external CLK/serial-in/RESET_B/EN nets, via its DFF/mux/clkbuf
+    instances' own known library pin names -- NOT by hardcoding the
+    specific (synthetic, unstable -- see chip.Chip._net_name) net-name
+    string each one happens to resolve to on this particular run.
+
+    serial-in specifically is found by elimination: every mux2_1's A0/A1
+    pin is wired to either a DFF's own Q (an internal, same-cluster net)
+    or -- for exactly one bit -- the cluster's external serial input.
+    Collecting every mux input net NOT in the cluster's own set of Q nets
+    should leave exactly that one net; if it doesn't (e.g. a differently-
+    wired design), this returns None rather than guessing.
+
+    clk needs the same care: a cluster can have more than one clkbuf_16
+    chained together (confirmed on adder_demo -- one of its two shift-
+    register clusters buffers its clock in a single stage, the other in
+    two), so "any clkbuf's own input" isn't safe to assume is the
+    cluster's true external clock -- it might be another clkbuf's own
+    output instead. The right one is whichever clkbuf's own input ISN'T
+    any other clkbuf's own output within this same cluster.
+
+    Returns (clk, serial_in, reset_b, en), or None if this cluster
+    doesn't have the expected instance/pin shape at all.
+    """
+    dffs = [i for i in cluster.instances if i.cell.cell_name == "sky130_fd_sc_hd__dfrtp_2"]
+    muxes = [i for i in cluster.instances if i.cell.cell_name == "sky130_fd_sc_hd__mux2_1"]
+    clkbufs = [i for i in cluster.instances if i.cell.cell_name == "sky130_fd_sc_hd__clkbuf_16"]
+    if not dffs or not muxes or not clkbufs:
+        return None
+
+    clkbuf_outputs = {c.global_pins.get("X") for c in clkbufs}
+    outermost = [c for c in clkbufs if c.global_pins.get("A") not in clkbuf_outputs]
+    if len(outermost) != 1:
+        return None
+    clk = outermost[0].global_pins.get("A")
+    reset_b = dffs[0].global_pins.get("RESET_B")
+    en = muxes[0].global_pins.get("S")
+    q_nets = {d.global_pins.get("Q") for d in dffs}
+
+    external = set()
+    for m in muxes:
+        for pin in ("A0", "A1"):
+            net = m.global_pins.get(pin)
+            if net is not None and net not in q_nets:
+                external.add(net)
+    if None in (clk, reset_b, en) or len(external) != 1:
+        return None
+    return clk, next(iter(external)), reset_b, en
+
+
+def run_cluster_z3_test(chip, clusters):
+    """comparator496's own cluster in isolation: eq=1 should have EXACTLY
+    1 satisfying 9-bit input combination (val == 496); eq=0 should have
+    EXACTLY 511 (every other 9-bit value) -- both closed-form counts,
+    not just "some solution exists".
+
+    Returns (ok, detail) -- detail is a dict for the printed report; ok
+    is None (not applicable, not failed) if this design doesn't have a
+    matching cluster to test at all.
+    """
+    cluster = _find_comparator_cluster(clusters)
+    if cluster is None:
+        return None, {"reason": "no comparator-shaped cluster found"}
+
+    _, _, sol_true = find_cluster_inputs_for_output(chip, cluster, 1)
+    _, _, sol_false = find_cluster_inputs_for_output(chip, cluster, 0)
+    detail = {"eq=1 solutions": len(sol_true), "eq=0 solutions": len(sol_false)}
+    ok = len(sol_true) == 1 and len(sol_false) == 511
+    return ok, detail
+
+
+def run_chip_z3_test(chip, clusters):
+    """The whole chip's combinational logic (build_chip_z3_circuit),
+    with both shift-register clusters' own outputs left as free
+    (register-state) variables: exactly 16 free nets (2 x 8-bit register
+    state), and exactly 15 free-variable assignments make the chip's own
+    combinational output net equal 1 -- the closed-form count of 8-bit
+    (a, b) pairs with a + b == 496 (adder8's 8-bit operands, compared
+    against comparator496's constant -- see warmup/00_source.v).
+
+    Returns (ok, detail), (None, detail) if not applicable -- same
+    convention as run_cluster_z3_test.
+    """
+    free_nets, solutions = find_chip_inputs_for_output(chip, clusters, 1)
+    detail = {"free_nets": len(free_nets), "solutions": len(solutions)}
+    if not free_nets:
+        return None, detail
+    ok = len(free_nets) == 16 and len(solutions) == 15
+    return ok, detail
+
+
+def run_shift_register_pyspice_test(chip, clusters):
+    """One of adder_demo's two 8-bit shift-register clusters, simulated
+    as a whole via simulate_cluster_transient() (real SPICE, not a
+    switch-level z3 model -- see this module's docstring for why): after
+    RESET_B is released and eight rising clock edges shift in eight
+    1-bits with EN held high, every one of the cluster's 8 output nets
+    should read 1; asserting RESET_B=0 immediately afterward (no clock
+    edge needed) should instantly clear all 8 back to 0.
+
+    Returns (ok, detail), (None, detail) if not applicable -- same
+    convention as run_cluster_z3_test.
+    """
+    sr_clusters = _find_shift_register_clusters(clusters)
+    if not sr_clusters:
+        return None, {"reason": "no shift-register-shaped cluster found"}
+
+    # Prefer whichever candidate's own output nets are EXACTLY its 8 Q
+    # pins and nothing else -- clustering can (confirmed on adder_demo)
+    # place a clock-tree buffer stage that fans out to a SIBLING cluster's
+    # own clkbuf inside this one, which cluster_io_nets then correctly
+    # reports as one of this cluster's own "outputs" (driven inside,
+    # consumed outside) even though it's a clock signal, not a register
+    # bit. Picking the cluster where that doesn't happen keeps this test
+    # a clean, unambiguous check of the register's own 8 Q outputs.
+    cluster, output_nets = None, None
+    for candidate in sr_clusters:
+        _, candidate_outputs = cluster_io_nets(chip, candidate)
+        if len(candidate_outputs) == 8:
+            cluster, output_nets = candidate, candidate_outputs
+            break
+    if cluster is None:
+        return None, {"reason": "no shift-register cluster had exactly 8 clean (Q-only) output nets"}
+
+    nets = _find_shift_register_nets(cluster)
+    if nets is None:
+        return None, {"reason": "shift-register cluster didn't have the expected CLK/mux/reset wiring"}
+    clk, serial_in, reset_b, en = nets
+
+    events = [(0, {clk: 0, serial_in: 0, reset_b: 0, en: 0})]
+    t = 40
+    events.append((t, {clk: 0, serial_in: 1, reset_b: 1, en: 1}))
+    for _ in range(8):
+        t += 40
+        events.append((t, {clk: 1, serial_in: 1, reset_b: 1, en: 1}))
+        t += 40
+        events.append((t, {clk: 0, serial_in: 1, reset_b: 1, en: 1}))
+    probe_after_shifts = t + 20
+    t += 40
+    events.append((t, {clk: 0, serial_in: 1, reset_b: 0, en: 1}))
+    probe_after_reset = t + 20
+
+    events = [(tt * _NS, values) for tt, values in events]
+    after_shifts, after_reset = simulate_cluster_transient(
+        chip, cluster, events, [probe_after_shifts * _NS, probe_after_reset * _NS], edge_time=2e-9
+    )
+    detail = {
+        "after_8_shifts": dict(zip(output_nets, after_shifts)),
+        "after_reset": dict(zip(output_nets, after_reset)),
+    }
+    ok = all(v == 1 for v in after_shifts) and all(v == 0 for v in after_reset)
+    return ok, detail
+
+
+CHIP_TESTS = {
+    "cluster z3 (comparator496)": run_cluster_z3_test,
+    "chip z3 (combinational, register state free)": run_chip_z3_test,
+    "shift register (PySpice, whole cluster)": run_shift_register_pyspice_test,
+}
+
+
+def run_chip_tests(gds_file, top_cell_name):
+    """Build a Chip and cluster it once, then run every CHIP_TESTS entry
+    against the result. Prints a report in the same style as run()'s own
+    leaf-cell summary.
+
+    Returns True if every applicable test passed (a test that reported
+    "not applicable" -- e.g. this design doesn't have a comparator-shaped
+    cluster at all -- doesn't count as a failure)."""
+    print(f"\nchip/cluster-level tests for {top_cell_name} ({gds_file}):\n")
+
+    chip = Chip(gds_file, top_cell_name)
+    clusters = cluster_chip(chip, min_cluster_size=1)
+
+    all_ok = True
+    for name, test_fn in CHIP_TESTS.items():
+        ok, detail = test_fn(chip, clusters)
+        if ok is None:
+            status = "SKIPPED"
+        elif ok:
+            status = "PASS"
+        else:
+            status = "FAIL"
+            all_ok = False
+        print(f"  {name}: {status}")
+        for key, value in detail.items():
+            print(f"    {key}: {value}")
+
+    return all_ok
 
 
 def find_logic_cells(gds_file):
@@ -261,5 +495,8 @@ def run(gds_file):
 
 if __name__ == "__main__":
     gds_file = sys.argv[1] if len(sys.argv) > 1 else "./warmup/04_final.gds"
-    ok = run(gds_file)
-    sys.exit(0 if ok else 1)
+    top_cell_name = sys.argv[2] if len(sys.argv) > 2 else "adder_demo"
+
+    leaf_ok = run(gds_file)
+    chip_ok = run_chip_tests(gds_file, top_cell_name)
+    sys.exit(0 if (leaf_ok and chip_ok) else 1)

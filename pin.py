@@ -275,41 +275,55 @@ class LeafCellAnalyzer:
             cls._cache[key] = cls(gds_path, leaf_cell_name, leaf_cell_index)
         return cls._cache[key]
 
-    def classify_pin_direction(self, pin_name, texttype=5):
-        """Return "input", "output", "ambiguous", or "unknown" for one
-        named pin of this leaf cell, by tracing its net down to whatever
-        it terminates on transistor-wise (see module docstring)."""
-        # a pin can be stamped more than once (e.g. one label per finger),
-        # so gather every matching label and combine what all of them
-        # trace to, rather than betting on the first one landing on a
-        # live polygon.
-        matching_labels = [
-            lbl for lbl in self.labels
-            if lbl.text == pin_name and lbl.texttype == texttype
-        ]
-        if not matching_labels:
-            return "unknown"
+    def _pin_seed_polygons(self, pin_name, texttype=5):
+        """Every (poly, key) pair -- from this leaf cell's own li1/met1
+        lists, in this cell's own LOCAL coordinate system -- landing under
+        one of `pin_name`'s own matching labels. A pin can be stamped more
+        than once (e.g. one label per finger), so this gathers every
+        matching label's own polygon rather than betting on the first one
+        landing on a live polygon.
 
-        equivalents = set()
-        matched_any = False
+        These are this leaf cell's OWN library-internal labels (from
+        LeafCellAnalyzer's own `self.labels`, loaded from the leaf cell's
+        standalone definition -- see this class's docstring), not a
+        routed top-level design's per-instance net labels. Shared by
+        classify_pin_direction() (which only needs the net each seed
+        traces to) and pin_local_polygons() (which needs the polygon
+        itself, for chip.py to transform through a specific instance's
+        placement -- see chip.Chip._instance_global_pins)."""
+        matching_labels = [lbl for lbl in self.labels if lbl.text == pin_name and lbl.texttype == texttype]
+        seeds = []
         for lbl in matching_labels:
-            node_key = None
             # sky130 stamps pin labels on li1, not met1 -- but check met1
             # too as a fallback in case a particular library/cell differs.
             for layer_polys in (self._li1, self._met1):
                 for poly, key in layer_polys:
                     if gdstk.inside([lbl.origin], [poly])[0]:
-                        node_key = key
+                        seeds.append((poly, key))
                         break
-                if node_key:
-                    break
-            if node_key is None:
-                continue
-            matched_any = True
-            equivalents.update(self.tracer.trace(node_key))
+                else:
+                    continue
+                break
+        return seeds
 
-        if not matched_any:
+    def pin_local_polygons(self, pin_name, texttype=5):
+        """Local-coordinate polygons for one of this leaf cell's own named
+        pins -- see _pin_seed_polygons's docstring for exactly what these
+        are and why they're safe to use where a routed design's own
+        per-instance net labels wouldn't be."""
+        return [poly for poly, _ in self._pin_seed_polygons(pin_name, texttype=texttype)]
+
+    def classify_pin_direction(self, pin_name, texttype=5):
+        """Return "input", "output", "ambiguous", or "unknown" for one
+        named pin of this leaf cell, by tracing its net down to whatever
+        it terminates on transistor-wise (see module docstring)."""
+        seeds = self._pin_seed_polygons(pin_name, texttype=texttype)
+        if not seeds:
             return "unknown"
+
+        equivalents = set()
+        for _, node_key in seeds:
+            equivalents.update(self.tracer.trace(node_key))
 
         touches_gate = any(e.startswith("G") for e in equivalents)  # GN_i / GP_i
         touches_diff = any(e.startswith("D") for e in equivalents)  # DN_i / DP_i
