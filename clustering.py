@@ -757,39 +757,64 @@ def build_chip_z3_circuit(chip, clusters):
 def find_chip_inputs_for_output(chip, clusters, target, output_net=None):
     """Find every free-variable assignment (chip primary inputs and/or
     sequential-cluster/register state, see build_chip_z3_circuit) that
-    produces `target` on one of this chip's own combinational output
-    nets -- the chip-wide analogue of find_cluster_inputs_for_output(),
-    built by combining every recovered cluster's own z3 model instead of
-    one cluster's.
+    produces `target` on this chip's own combinational output net(s) --
+    the chip-wide analogue of find_cluster_inputs_for_output(), built by
+    combining every recovered cluster's own z3 model instead of one
+    cluster's.
 
     Args:
         chip: the chip.Chip clusters was computed from.
         clusters: list of Cluster covering (ideally all of) chip's own
             instances, e.g. from cluster_chip().
-        target: the output value (0/1) to solve for.
-        output_net: which of build_chip_z3_circuit's own chip_output_nets
-            to solve for. Required if there's more than one; defaults to
-            the only one otherwise.
+        target: the output value(s) to solve for -- EITHER a single 0/1,
+            constraining just `output_net` (or the chip's own only
+            output net, if there's just one and output_net is omitted);
+            OR a dict {output_net: 0/1} constraining SEVERAL output nets
+            AT ONCE -- a genuine joint solve (every net in the dict must
+            equal its own target simultaneously in the same model, not
+            found by intersecting separate single-output searches),
+            mirroring find_cluster_inputs_for_output's own vector target
+            one level down. output_net must be omitted when target is a
+            dict -- the dict's own keys already say which nets.
+        output_net: which single chip_output_nets entry `target` refers
+            to, when target is a plain 0/1. Required if there's more
+            than one chip-level output net; defaults to the only one
+            otherwise. Must be None when target is a dict.
 
     Returns:
         (free_nets, solutions) -- free_nets is the ordered net-name list
         each solution tuple's values correspond to; solutions is a list
-        of tuples of 0/1 ints, one tuple per assignment for which
-        output_net == target.
+        of tuples of 0/1 ints, one tuple per assignment for which every
+        targeted output net matches its own target value.
     """
     circuit, net_vars, free_nets, chip_output_nets = build_chip_z3_circuit(chip, clusters)
     if not chip_output_nets:
         raise ValueError("no net in this chip's combinational logic reads as a chip-level output -- nothing to solve for")
-    if output_net is None:
-        if len(chip_output_nets) != 1:
-            raise ValueError(f"chip has {len(chip_output_nets)} combinational output net(s) {chip_output_nets}; pass output_net explicitly")
-        output_net = chip_output_nets[0]
-    elif output_net not in chip_output_nets:
-        raise ValueError(f"{output_net!r} isn't one of this chip's own combinational output nets {chip_output_nets}")
+
+    if isinstance(target, dict):
+        if output_net is not None:
+            raise ValueError("output_net must not be given when target is a dict of {output_net: value} pairs")
+        targets = dict(target)
+        if not targets:
+            raise ValueError("target dict is empty -- nothing to constrain")
+    else:
+        if output_net is None:
+            if len(chip_output_nets) != 1:
+                raise ValueError(
+                    f"chip has {len(chip_output_nets)} combinational output net(s) {chip_output_nets}; "
+                    f"pass output_net explicitly, or target as a dict of {{output_net: value}} pairs"
+                )
+            output_net = chip_output_nets[0]
+        targets = {output_net: target}
+
+    unknown = [net for net in targets if net not in chip_output_nets]
+    if unknown:
+        raise ValueError(f"{unknown!r} not among this chip's own combinational output net(s) {chip_output_nets}")
 
     solver = z3.Solver()
     solver.add(circuit)
-    solver.add(net_vars[output_net] == bool(target))
+    for net, value in targets.items():
+        solver.add(net_vars[net] == bool(value))
 
     free_vars = [net_vars[net] for net in free_nets]
     solutions = []
@@ -834,13 +859,16 @@ def find_chip_inputs_for_output(chip, clusters, target, output_net=None):
 #     outside every placed instance's own footprint. Falls back to a
 #     generic "reg<cluster id>" name if no single input net matches
 #     exactly one top-level port.
-#   - Each net's NUMBER within a group is just a stable, deterministic
-#     order (sorted net name) -- NOT a reconstruction of true bit
-#     significance (which bit is the MSB/LSB). Recovering that would
-#     need assuming a specific register topology (e.g. "an unlabeled pin
-#     hold-vs-shift convention for a shift register built from THESE
-#     specific cell types"), which is exactly the kind of design-specific
-#     assumption this project's own puzzle GDS won't cooperate with.
+#   - Each net's NUMBER within a group is TRUE bit significance (which
+#     bit is the MSB/LSB) when _recover_chain_order() can confirm the
+#     group forms a simple shift chain -- a purely structural, net-
+#     identity-based check (does one stage's own output feed straight
+#     back into whatever selects its own next value -- see that
+#     function's own docstring), no cell name or per-design label
+#     involved. Falls back to a stable, deterministic but NOT
+#     bit-significant sort (by net name) whenever the group doesn't match
+#     that shape -- e.g. a register organized some other way, or a hold
+#     path routed through extra logic instead of a direct self-loop net.
 
 
 def _all_top_level_port_nets(chip):
@@ -918,6 +946,113 @@ def _max_transitive_fanout(cluster, net):
     return max_fanout
 
 
+def _recover_chain_order(cluster, nets):
+    """Recover TRUE bit significance for `nets` (one sequential cluster's
+    own group of free/register-state nets) when they form a simple shift
+    chain, purely from connectivity -- no cell name, no pin name, no
+    per-design label. Returns an ordered list (bit 0 first) if the
+    structure matches, or None if it doesn't (caller falls back to the
+    existing stable-sort-by-net-name numbering).
+
+    The structural signature this looks for, entirely net-identity based:
+    each net N in the group is driven by some instance inst_N (its
+    register stage). Somewhere among inst_N's own input nets is one
+    driven by another instance ("driver") whose OWN inputs include N
+    itself -- a literal self-loop, N feeding back into whatever decides
+    inst_N's next value. That's the "hold" path (keep my own value).
+
+    The driver's remaining inputs (found on a real mux2_1: not just the
+    hold net, but ALSO its own select/enable pin) then need one more
+    filter before picking a "shift" path -- a mux's select/enable input
+    is BROADCAST to every stage's own mux at once, so it shows up as a
+    "remaining input" for every single net in the group, not just this
+    one. The real shift-data net, by contrast, is only ever read here
+    (this stage's hold/shift mux) and by its own immediate neighbor
+    stage's mux -- at most 2 uses anywhere in the cluster, against a
+    select/enable signal's usage count of (typically) one per stage. So:
+    among the driver's remaining inputs, the one used (as an input,
+    anywhere in this cluster) the FEWEST times is taken as the real shift
+    source -- requiring a unique minimum, not just "not the most-used
+    one", so a genuinely ambiguous case bails out rather than guesses.
+    That's a broadcast-vs-local-fanout distinction, the same kind
+    _max_transitive_fanout() already uses one level up (label_free_nets'
+    own control-vs-data disambiguation) -- never a cell name or pin name.
+
+    The shift source found this way is therefore either another net in
+    the group (this chain's predecessor stage) or a net external to the
+    group entirely (this is bit 0, the chain's own head, normally fed by
+    the cluster's true serial-in). Following "whoever's shift source is
+    net X" from bit 0 onward traces the whole chain.
+
+    This never assumes which physical pin is "select 0" vs "select 1" on
+    whatever 2-to-1 selector cell drives the hold/shift choice, or that
+    such a cell even has a particular name -- it only relies on the hold
+    path being a DIRECT net-level self-loop (true for this project's own
+    dfrtp_2 + mux2_1 pairing; a design with extra logic between a
+    register's output and its own hold input would fail this check and
+    fall back, not silently mislabel).
+    """
+    driver_of = {}
+    usage = Counter()
+    for inst in cluster.instances:
+        for pin in inst.cell.output_labels:
+            net = inst.global_pins.get(pin)
+            if net is not None:
+                driver_of[net] = inst
+        for pin in inst.cell.input_labels:
+            net = inst.global_pins.get(pin)
+            if net is not None:
+                usage[net] += 1
+
+    predecessor = {}
+    for n in nets:
+        inst_n = driver_of.get(n)
+        if inst_n is None:
+            return None
+
+        shift_sources = set()
+        for pin in inst_n.cell.input_labels:
+            d_net = inst_n.global_pins.get(pin)
+            driver = driver_of.get(d_net) if d_net is not None else None
+            if driver is None or driver is inst_n:
+                continue
+            driver_inputs = {driver.global_pins.get(p) for p in driver.cell.input_labels}
+            driver_inputs.discard(None)
+            if n not in driver_inputs:
+                continue
+            candidates = driver_inputs - {n}
+            if not candidates:
+                continue
+            min_usage = min(usage[c] for c in candidates)
+            least_used = [c for c in candidates if usage[c] == min_usage]
+            if len(least_used) == 1:
+                shift_sources.add(least_used[0])
+
+        if len(shift_sources) != 1:
+            return None  # no clean hold/shift split found for this stage
+        predecessor[n] = next(iter(shift_sources))
+
+    external_starts = [n for n in nets if predecessor[n] not in nets]
+    if len(external_starts) != 1:
+        return None  # not exactly one chain head -- not a simple linear chain
+
+    successor = {}
+    for n, s in predecessor.items():
+        if s in nets:
+            if s in successor:
+                return None  # two stages both claim the same predecessor
+            successor[s] = n
+
+    order = [external_starts[0]]
+    for _ in range(len(nets) - 1):
+        nxt = successor.get(order[-1])
+        if nxt is None:
+            return None  # chain doesn't cover every net in the group
+        order.append(nxt)
+
+    return order if set(order) == set(nets) else None
+
+
 def label_free_nets(chip, clusters, free_nets):
     """Best-effort human-readable label for each of build_chip_z3_circuit's
     own free nets -- e.g. "A#0".."A#7" for one sequential cluster's own
@@ -963,7 +1098,12 @@ def label_free_nets(chip, clusters, free_nets):
         # anywhere along the way.
         group_name = min(matches, key=lambda n: (_max_transitive_fanout(cluster, n), n), default=None)
         group_name = net_to_port[group_name] if group_name is not None else f"reg{cluster.id}"
-        for i, net in enumerate(sorted(nets)):
+
+        # true bit order when the group is a recoverable shift chain (see
+        # _recover_chain_order); otherwise fall back to the old
+        # deterministic-but-arbitrary stable sort.
+        ordered_nets = _recover_chain_order(cluster, nets) or sorted(nets)
+        for i, net in enumerate(ordered_nets):
             labels[net] = f"{group_name}#{i}"
 
     return labels

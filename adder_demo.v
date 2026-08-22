@@ -77,7 +77,7 @@ module sky130_fd_sc_hd__dfrtp_2 (
     input RESET_B,
     output reg Q
 );
-    // tier2(characterized)
+    // tier1(known-cell)
     always @(posedge CLK or negedge RESET_B) begin
         if (!RESET_B) begin
             Q <= 1'b0;
