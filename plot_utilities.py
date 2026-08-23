@@ -7,13 +7,17 @@ geometry. Each gdstk.Polygon exposes its vertices as a numpy array via
 `.points`, so the standard way to "see" them from Python is to wrap those
 vertices in matplotlib patches and let matplotlib do the drawing.
 
-Three layers of visualization live here:
+Four layers of visualization live here:
 
   - plot_cell/plot_polygon/plot_labels: raw GDS layout -- draw a cell's
     polygons by layer, optionally overlaying the transistor gates found by
     transistor.count_transistors() (the poly/diff intersection regions) as
     black-hatched outlines, so you can visually confirm what geometry was
     counted.
+  - plot_net: one cell's own named input/output pins, highlighted and
+    labeled -- either a leaf standard cell's own layout (cell.Cell), or
+    (chip_io_only=True) just a routed top cell's primary I/O nets
+    (chip.Chip) without redrawing its entire routing fabric.
   - plot_instance_pins: what instance_pins.py (and pin_direction.py)
     actually find for one placed instance -- the instance's footprint, and
     every detected pin group drawn in its own color and labeled with its
@@ -31,6 +35,8 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, Patch, Rectangle
 from matplotlib.patches import Polygon as MplPolygon
 
+from cell import Cell
+from chip import Chip
 from pin import find_instance_pins, label_instance_pins
 from transistor import count_transistors, TransistorType
 
@@ -119,6 +125,165 @@ def plot_cell(gds_path, cell_name, out_path="layout.png", highlight_gates=True, 
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     print(f"wrote {out_path}")
+
+
+PIN_STYLE = {"input": "#1f77b4", "output": "#d62728"}
+
+
+def plot_net(gds_path, cell_name, out_path=None, chip_io_only=False):
+    """Render one cell's input/output pins, highlighted and labeled.
+
+    Args:
+        gds_path: path to the GDS file.
+        cell_name: name of the cell to plot -- a leaf standard cell (e.g.
+            "sky130_fd_sc_hd__and3_2") by default, or a routed TOP cell
+            (e.g. "adder_demo") if chip_io_only=True.
+        out_path: PNG path to write; defaults to "<cell_name>_net.png".
+        chip_io_only: False (default) treats `cell_name` as one leaf
+            standard cell -- draws its full poly/diff/nwell layout (same
+            LAYER_STYLE as plot_cell()) with every one of its own named
+            pins highlighted, via cell.Cell's own pin-direction
+            classification. This does NOT scale to a whole routed chip:
+            depth=None flattens every placed instance's own poly/diff/
+            nwell geometry too (tens of thousands of polygons for a real
+            design), and cell.Cell tries to run leaf-cell transistor
+            extraction on `cell_name` itself, which a top cell isn't.
+
+            Pass True when `cell_name` is a routed top cell instead: this
+            skips the whole-chip layout draw and the leaf-cell model
+            entirely, and instead uses chip.Chip's own (spatial-grid-
+            based, built for this exact scale) net tracing to find just
+            that chip's own primary_inputs/primary_outputs -- its true
+            top-level ports, not its internal wiring -- and draws only
+            those nets' own routing shapes (chip.Chip.net_polygons()),
+            each labeled with its resolved name. See _plot_chip_io_nets().
+    """
+    if chip_io_only:
+        return _plot_chip_io_nets(gds_path, cell_name, out_path)
+
+    cell = Cell(gds_path, cell_name)
+
+    library = gdstk.read_gds(gds_path)
+    raw_cell = next((c for c in library.cells if c.name == cell_name), None)
+    if raw_cell is None:
+        raise ValueError(f"Cell {cell_name!r} not found in {gds_path!r}")
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    legend_handles = []
+
+    for (layer, datatype), style in LAYER_STYLE.items():
+        polys = raw_cell.get_polygons(depth=None, layer=layer, datatype=datatype)
+        if not polys:
+            continue
+        patches = [MplPolygon(p.points, closed=True) for p in polys]
+        ax.add_collection(
+            PatchCollection(patches, facecolor=style["color"], edgecolor=style["color"], alpha=style["alpha"])
+        )
+        legend_handles.append(Patch(facecolor=style["color"], alpha=style["alpha"], label=style["label"]))
+
+    for direction, pin_names in (("input", cell.input_labels), ("output", cell.output_labels)):
+        color = PIN_STYLE[direction]
+        for pin_name in pin_names:
+            polys = cell._analyzer.pin_local_polygons(pin_name)
+            if not polys:
+                print(f"warning: no routing geometry found for pin {pin_name!r}, skipping")
+                continue
+
+            patches = [MplPolygon(p.points, closed=True) for p in polys]
+            ax.add_collection(
+                PatchCollection(patches, facecolor=color, edgecolor="black", alpha=0.65, linewidth=0.8, zorder=3)
+            )
+
+            # label at the centroid of the largest polygon in the group,
+            # same reasoning as plot_instance_pins() -- a pin can be
+            # stamped on more than one disjoint piece (e.g. one per
+            # finger), and an average over all of them can land in a gap.
+            biggest = max(polys, key=lambda p: p.area())
+            cx, cy = biggest.points.mean(axis=0)
+            ax.annotate(
+                pin_name, (cx, cy), ha="center", va="center", fontsize=8, fontweight="bold", zorder=4,
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.8, edgecolor="none"),
+            )
+        legend_handles.append(Patch(facecolor=color, alpha=0.65, label=f"{direction} pin"))
+
+    ax.set_aspect("equal")
+    ax.autoscale_view()
+    ax.set_xlabel("x (um)")
+    ax.set_ylabel("y (um)")
+    ax.set_title(f"{cell_name} pins  ({gds_path})")
+    ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8)
+
+    fig.tight_layout()
+    out_path = out_path or f"{cell_name}_net.png"
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print(f"wrote {out_path}  ({len(cell.input_labels)} input(s), {len(cell.output_labels)} output(s))")
+    return out_path
+
+
+def _plot_chip_io_nets(gds_path, top_cell_name, out_path=None):
+    """plot_net(chip_io_only=True)'s actual implementation -- see that
+    function's docstring for why this exists as a separate path instead
+    of just calling plot_net's default leaf-cell code on a top cell.
+
+    Draws a dashed chip-footprint outline (from placed instances' own
+    bounding boxes, same trick clustering.py's top-level port scan uses --
+    top_cell.bounding_box() itself walks the same tens-of-thousands of
+    shapes this function exists to avoid touching) for orientation, then
+    only chip.primary_inputs/primary_outputs' own routing shapes
+    (chip.Chip.net_polygons()) -- not the chip's entire routing fabric.
+    """
+    chip = Chip(gds_path, top_cell_name)
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    legend_handles = []
+
+    boxes = [r.bounding_box() for r in chip.top_cell.references if r.bounding_box() is not None]
+    if boxes:
+        fx0 = min(b[0][0] for b in boxes)
+        fy0 = min(b[0][1] for b in boxes)
+        fx1 = max(b[1][0] for b in boxes)
+        fy1 = max(b[1][1] for b in boxes)
+        ax.add_patch(
+            Rectangle((fx0, fy0), fx1 - fx0, fy1 - fy0, fill=False,
+                      edgecolor="black", linestyle="--", linewidth=1.0, zorder=1)
+        )
+        legend_handles.append(Patch(fill=False, edgecolor="black", linestyle="--", label="chip footprint"))
+
+    for direction, net_names in (("input", chip.primary_inputs), ("output", chip.primary_outputs)):
+        color = PIN_STYLE[direction]
+        for net_name in net_names:
+            polys = chip.net_polygons(net_name)
+            if not polys:
+                print(f"warning: no routing geometry found for net {net_name!r}, skipping")
+                continue
+
+            patches = [MplPolygon(p.points, closed=True) for p in polys]
+            ax.add_collection(
+                PatchCollection(patches, facecolor=color, edgecolor="black", alpha=0.7, linewidth=0.8, zorder=3)
+            )
+
+            biggest = max(polys, key=lambda p: p.area())
+            cx, cy = biggest.points.mean(axis=0)
+            ax.annotate(
+                net_name, (cx, cy), ha="center", va="center", fontsize=8, fontweight="bold", zorder=4,
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.8, edgecolor="none"),
+            )
+        legend_handles.append(Patch(facecolor=color, alpha=0.7, label=f"{direction} pin"))
+
+    ax.set_aspect("equal")
+    ax.autoscale_view()
+    ax.set_xlabel("x (um)")
+    ax.set_ylabel("y (um)")
+    ax.set_title(f"{top_cell_name} primary I/O nets  ({gds_path})")
+    ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8)
+
+    fig.tight_layout()
+    out_path = out_path or f"{top_cell_name}_io_net.png"
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print(f"wrote {out_path}  ({len(chip.primary_inputs)} input(s), {len(chip.primary_outputs)} output(s))")
+    return out_path
 
 
 def plot_polygon(polygon, filename, ax=None):

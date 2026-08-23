@@ -16,9 +16,10 @@ under investigation.
 
 "Logic cell" here means the same geometric test chip.py's own
 _is_logic_cell() uses: does the cell have at least one pin that traces to
-a real transistor gate or diffusion terminal, as opposed to only power
-rails (VIA_*/decap/welltap cells all fail this and are skipped) -- not a
-name-based guess.
+a real transistor gate (an input) AND at least one that traces to a
+diffusion terminal (an output), as opposed to only power rails or only
+one side of that (VIA_*/decap/welltap/diode cells all fail this and are
+skipped) -- not a name-based guess.
 
 Sequential cells (anything with genuine internal state, e.g. dfrtp_2) are
 EXPECTED to raise partway through this check rather than pass cleanly --

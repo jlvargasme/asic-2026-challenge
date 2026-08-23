@@ -57,18 +57,21 @@ def _pin_net(prefix, pin_name):
     return f"{prefix}_{pin_name}"
 
 def _is_logic_cell(cell):
-    """A cell counts as logic if it has at least one functional
-    (non-power) pin -- derived purely from its own geometry, via
+    """A cell counts as logic if it has at least one input pin AND at
+    least one output pin -- derived purely from its own geometry, via
     cell.input_labels/output_labels (pin.LeafCellAnalyzer.
     classify_pin_direction traces each pin's net down to a transistor
     gate or diffusion terminal; power/ground names are excluded before
     either list is built), not from the cell's name.
 
-    This one check covers every non-logic reference this project's
-    example design places, for three different geometric reasons:
+    Requires BOTH, not just "any functional pin" -- a cell that actually
+    computes something always has some pin reaching a transistor GATE
+    (an input) and some pin reaching a DIFFUSION terminal (an output).
+    Anything with only one side of that can't be doing logic, no matter
+    how many pins it has:
       - VIA_* metal-stitching cells have no poly/diff layers at all, so
         count_transistors() finds zero transistors and there's nothing
-        to classify a pin from.
+        to classify a pin from -- both lists come back empty.
       - welltap cells (tapvpwrvgnd) likewise have no transistors -- they
         exist purely to strap the substrate/well to VPWR/VGND.
       - decap (decoupling capacitor) cells DO have transistors -- they're
@@ -77,8 +80,15 @@ def _is_logic_cell(cell):
         a power rail, so classify_pin_direction never finds a non-power
         pin either. Same test, same answer, without needing to know decap
         cells contain transistors at all while VIA_* cells don't.
+      - diode (antenna) cells DO have a named, non-power pin -- but it's
+        wired straight to a diffusion region with no transistor gate
+        anywhere on that net, so classify_pin_direction calls it
+        "output" and input_labels stays empty. A plain `input_labels or
+        output_labels` check (this function's earlier version) missed
+        this: one functional-looking pin isn't the same as computing
+        something.
     """
-    return bool(cell.input_labels or cell.output_labels)
+    return bool(cell.input_labels and cell.output_labels)
 
 class Cell:
     """One leaf standard cell, electrically modeled from its GDS layout.
