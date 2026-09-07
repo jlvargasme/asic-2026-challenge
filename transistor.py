@@ -121,7 +121,7 @@ def count_transistors(
     for gate in gates:
         overlap = gdstk.boolean(gate, nwell, "and", precision=precision)
         overlap_area = sum(p.area() for p in overlap)
-        if overlap_area > 0.5 * gate.area():
+        if overlap_area == gate.area():
             pmos += 1
         else:
             nmos += 1

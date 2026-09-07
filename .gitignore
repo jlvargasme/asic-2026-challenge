@@ -4,3 +4,10 @@ scratch.py
 HANDOFF.md
 chip.txt
 puzzle_wip.v
+sim/obj_dir_*
+sim/sim_adder_demo_*
+HANDOFF.md
+debug/*
+writeup/*
+scratch.*
+witness_ascii.txt

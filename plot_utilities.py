@@ -7,7 +7,7 @@ geometry. Each gdstk.Polygon exposes its vertices as a numpy array via
 `.points`, so the standard way to "see" them from Python is to wrap those
 vertices in matplotlib patches and let matplotlib do the drawing.
 
-Four layers of visualization live here:
+Five layers of visualization live here:
 
   - plot_cell/plot_polygon/plot_labels: raw GDS layout -- draw a cell's
     polygons by layer, optionally overlaying the transistor gates found by
@@ -22,6 +22,11 @@ Four layers of visualization live here:
     actually find for one placed instance -- the instance's footprint, and
     every detected pin group drawn in its own color and labeled with its
     resolved name.
+  - plot_clusters_optimized: clustering.plot_clusters()'s own chip-floorplan
+    picture, but after chip_manipulation.py's buffer-collapsing pass --
+    what the recovered RTL structure looks like once clock-tree-synthesis
+    noise is stripped back out, rather than the raw physically-placed
+    instance set.
   - draw_schematic: a transistor-level electrical schematic from the same
     gate/kind/source/drain data pipeline.py's "transistors renamed" step
     prints -- one row of PMOS symbols under a VDD rail, one row of NMOS
@@ -37,6 +42,8 @@ from matplotlib.patches import Polygon as MplPolygon
 
 from cell import Cell
 from chip import Chip
+from clustering import plot_clusters
+from chip_manipulation import DecompileError, _collapse_transparent_buffers, _stub_leaf, decompile_leaf
 from pin import find_instance_pins, label_instance_pins
 from transistor import count_transistors, TransistorType
 
@@ -443,6 +450,79 @@ def plot_instance_pins(gds_path, parent_name, instance_cell_name, instance_index
     plt.close(fig)
     print(f"wrote {out_path}  ({len(pins)} pin group(s))")
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Cluster floorplan plotting
+# ---------------------------------------------------------------------------
+
+
+def plot_clusters_optimized(chip, clusters, out_path="clusters_optimized.png", title=None, force_tier2=False):
+    """Render the same chip-floorplan cluster plot clustering.plot_clusters()
+    does, but AFTER running the one chip_manipulation.py pass that actually
+    changes cluster membership: chip_manipulation._collapse_transparent_
+    buffers() (see its own docstring) splices out every clock-buffer-tree
+    instance and re-aliases its consumers straight to its source --
+    shrinking, and for a cluster that was ENTIRELY buffers (e.g. a
+    leftover clock-buffer "cluster" from cluster_chip()'s own
+    small-cluster merging), sometimes completely emptying out, every
+    cluster it touches.
+
+    plot_clusters() itself doesn't want this done first: main.py's own
+    pipeline deliberately calls it BEFORE build_ast(), so the plot still
+    shows every physically-placed instance (including the buffers about
+    to be collapsed) -- that's what its actual job (an epsilon_scale
+    sanity check: does a cluster's footprint look like one real module on
+    the die) needs. This function is for the opposite question -- what
+    does the RECOVERED RTL structure look like once the buffer-tree noise
+    clock-tree synthesis introduced during physical implementation (see
+    _collapse_transparent_buffers's own docstring) is stripped back out --
+    an emptied-out cluster here means one fewer real module, not a bug.
+
+    Mutates `chip` and every Cluster in `clusters` IN PLACE, via
+    _collapse_transparent_buffers -- same as build_ast(). Call
+    clustering.plot_clusters() FIRST if you also want the pre-collapse
+    picture; there's no going back afterward on this chip/clusters pair.
+    (This deliberately doesn't just call build_ast() itself and plot the
+    result -- build_ast() also runs cluster-type dedup/bus-grouping,
+    neither of which chip.instances/Cluster.instances (what plot_clusters
+    actually reads) reflect at all, so running the full pipeline here
+    would just be slower for no visual difference.)
+
+    Args:
+        chip: the chip.Chip clusters was computed from.
+        clusters: list of Cluster, e.g. from cluster_chip().
+        out_path: PNG file to write.
+        title: optional title text; defaults to naming chip.top_cell.name,
+            the post-collapse cluster count, and how many instances were
+            collapsed out.
+        force_tier2: passed through to decompile_leaf() for every leaf
+            type -- see its own docstring. Only affects which combinational
+            cells get correctly recognized as transparent buffers, not
+            what gets plotted.
+
+    Returns:
+        out_path.
+    """
+    leaf_modules = {}
+    for inst in chip.instances:
+        if inst.cell.cell_name not in leaf_modules:
+            try:
+                leaf_modules[inst.cell.cell_name] = decompile_leaf(inst.cell, force_tier2=force_tier2)
+            except DecompileError as e:
+                leaf_modules[inst.cell.cell_name] = _stub_leaf(inst.cell, str(e))
+
+    before = len(chip.instances)
+    _collapse_transparent_buffers(chip, clusters, leaf_modules)
+    collapsed = before - len(chip.instances)
+
+    surviving = sum(1 for c in clusters if c.instances)
+    emptied = len(clusters) - surviving
+    default_title = (
+        f"{chip.top_cell.name} -- {surviving} cluster(s) after collapsing {collapsed} "
+        f"buffer instance(s)" + (f" ({emptied} cluster(s) emptied out)" if emptied else "")
+    )
+    return plot_clusters(chip, clusters, out_path=out_path, title=title or default_title)
 
 
 # ---------------------------------------------------------------------------

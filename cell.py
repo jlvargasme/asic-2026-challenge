@@ -36,6 +36,8 @@ on near VGS=0, an NMOS turns on near VGS=VDD) for a functional check of
 what a cell computes, not a timing- or power-accurate simulation.
 """
 
+import random
+
 import numpy as np
 import z3
 from PySpice.Spice.Netlist import Circuit
@@ -89,6 +91,78 @@ def _is_logic_cell(cell):
         something.
     """
     return bool(cell.input_labels and cell.output_labels)
+
+
+_sequential_cache = {}
+
+
+def _is_sequential_cell(cell, trials=6):
+    """True if `cell` contains a stateful element (flip-flop, latch) a
+    pure switch-level z3 model can't represent -- the same structural
+    test clustering.py's _cluster_is_sequential() uses one level up (a
+    whole cluster of instances), applied here to a single leaf cell's own
+    z3 model (cell.z3_circuit/z3_inputs/z3_outputs) instead: pin every
+    input to several different assignments in turn (all-0, all-1, and a
+    handful of pseudo-random ones -- a real reset/set input only
+    collapses the ambiguity for ONE specific polarity, not every pattern,
+    see _cluster_is_sequential's own docstring for why that matters), and
+    call the cell sequential if ANY output can be driven to BOTH 0 and 1
+    under a fixed input assignment for ANY of those patterns -- the
+    switch-level signature of an internal feedback loop.
+
+    No cell name is involved -- purely a property of the transistor
+    network's own topology, so this works for ANY stateful leaf cell a
+    library might define (this project's own sky130_fd_sc_hd__dfrtp_2,
+    but just as correctly a dfstp_2/dfxtp_2/latch/whatever else a
+    different design uses), not just cell types this project happens to
+    have already seen and hardcoded a name for.
+
+    Cached per (gds_file, cell_name, cell_index) -- like Cell itself, a
+    leaf cell's own sequential-ness never depends on where it's placed,
+    and re-solving the same small z3 model for every one of potentially
+    hundreds of placed instances of the same type would be pure waste.
+    """
+    key = (cell.gds_file, cell.cell_name, cell._analyzer.leaf_cell_index)
+    if key in _sequential_cache:
+        return _sequential_cache[key]
+
+    if not cell.input_labels or not cell.output_labels:
+        result = False
+    else:
+        rng = random.Random(0)
+        patterns = [
+            [False] * len(cell.input_labels),
+            [True] * len(cell.input_labels),
+            *([rng.random() < 0.5 for _ in cell.input_labels] for _ in range(trials)),
+        ]
+
+        solver = z3.Solver()
+        solver.add(cell.z3_circuit)
+        result = False
+        for pattern in patterns:
+            solver.push()
+            for name, value in zip(cell.input_labels, pattern):
+                solver.add(cell.z3_inputs[name] == value)
+            for name in cell.output_labels:
+                var = cell.z3_outputs[name]
+                solver.push()
+                solver.add(var == True)
+                can_high = solver.check() == z3.sat
+                solver.pop()
+                solver.push()
+                solver.add(var == False)
+                can_low = solver.check() == z3.sat
+                solver.pop()
+                if can_high and can_low:
+                    result = True
+                    break
+            solver.pop()
+            if result:
+                break
+
+    _sequential_cache[key] = result
+    return result
+
 
 class Cell:
     """One leaf standard cell, electrically modeled from its GDS layout.

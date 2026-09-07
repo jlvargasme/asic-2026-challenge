@@ -16,7 +16,7 @@ import sys
 from gds_utils import SKY130, label_diffusion_regions, load_cell
 from net_trace import NetTracer
 from pin import LeafCellAnalyzer
-from plot_utilities import draw_schematic
+from plot_utilities import draw_schematic, plot_cell
 from transistor import build_transistors, count_transistors
 
 
@@ -55,6 +55,7 @@ def main():
 
     cell = load_cell(gds_file, cell_name)
     print(f"=== {gds_file} :: {cell.name} ===\n")
+    # plot_cell(gds_file, cell_name, out_path=cell_name+".png", highlight_gates=True, gate_labels=None)
 
     # 1. count + locate transistor gates
     result = count_transistors(gds_file, cell.name)

@@ -90,7 +90,7 @@ from matplotlib.collections import PatchCollection
 from matplotlib.patches import Patch, Rectangle
 from PySpice.Spice.Netlist import Circuit
 
-from cell import GROUND, NMOS_MODEL, NMOS_PARAMS, PMOS_MODEL, PMOS_PARAMS
+from cell import GROUND, NMOS_MODEL, NMOS_PARAMS, PMOS_MODEL, PMOS_PARAMS, _is_sequential_cell
 from chip import PIN_TEXTTYPE
 from transistor import TransistorType, transistor_to_pyspice, transistor_to_z3
 from union_find import UnionFind
@@ -396,53 +396,70 @@ def cluster_io_nets(chip, cluster):
     return sorted(input_nets), sorted(output_nets)
 
 
-def find_cluster_inputs_for_output(chip, cluster, target):
+def find_cluster_inputs_for_output(chip, cluster, target, max_solutions=None):
     """Find every input assignment for `cluster`'s own external input nets
-    that produces `target` on ALL of its own external output nets
-    simultaneously -- mirrors cell.Cell.find_inputs_for_output(), but for
-    a whole recovered cluster (candidate RTL module) made of several
-    instances instead of one leaf standard cell, and solving for the
-    cluster's full output vector at once rather than one output pin at a
-    time.
+    that produces `target` on its own external output net(s) -- mirrors
+    cell.Cell.find_inputs_for_output(), but for a whole recovered cluster
+    (candidate RTL module) made of several instances instead of one leaf
+    standard cell.
 
     Args:
         chip: the chip.Chip cluster's instances came from -- needed to
             tell which of the cluster's own nets are its external inputs/
             outputs versus purely internal (see cluster_io_nets).
         cluster: a Cluster, e.g. from cluster_chip().
-        target: the output value(s) to solve for -- a single 0/1 if the
-            cluster has exactly one external output net, else a sequence
-            of 0/1 values, one per entry of this cluster's own
-            output_nets (see cluster_io_nets), in that same order.
+        target: the output value(s) to solve for -- EITHER a single 0/1
+            (only valid if the cluster has exactly one external output
+            net) or a sequence of 0/1 values, one per entry of this
+            cluster's own output_nets (see cluster_io_nets), in that same
+            order, constraining EVERY output net simultaneously; OR a
+            dict {output_net: 0/1} constraining just SOME of them (e.g.
+            one specific net out of several) -- every other output net is
+            left completely free. Mirrors find_chip_inputs_for_output's
+            own scalar/sequence/dict target handling one level up.
+        max_solutions: stop after this many solutions instead of
+            enumerating every one (default: unbounded) -- a target that
+            only constrains SOME output nets can otherwise have a
+            combinatorially large, mostly-irrelevant solution count.
 
     Returns:
         (input_nets, output_nets, solutions) -- input_nets/output_nets are
         the ordered net-name lists `target` and each solution tuple's
         values correspond to; solutions is a list of tuples of 0/1 ints,
-        one tuple per input assignment for which every output net matches
-        `target`.
+        one tuple per input assignment for which every net named in
+        `target` matches its own target value.
     """
     input_nets, output_nets = cluster_io_nets(chip, cluster)
     if not output_nets:
         raise ValueError("cluster has no net that reads as an external output -- nothing to solve for")
 
-    targets = [target] if isinstance(target, int) else list(target)
-    if len(targets) != len(output_nets):
-        raise ValueError(
-            f"cluster has {len(output_nets)} external output net(s) {output_nets}; "
-            f"target must give exactly that many 0/1 value(s), got {len(targets)}"
-        )
+    if isinstance(target, dict):
+        targets = dict(target)
+        if not targets:
+            raise ValueError("target dict is empty -- nothing to constrain")
+        unknown = [n for n in targets if n not in output_nets]
+        if unknown:
+            raise ValueError(f"{unknown!r} not among this cluster's own external output net(s) {output_nets}")
+    else:
+        values = [target] if isinstance(target, int) else list(target)
+        if len(values) != len(output_nets):
+            raise ValueError(
+                f"cluster has {len(output_nets)} external output net(s) {output_nets}; "
+                f"target must give exactly that many 0/1 value(s) (or a {{net: value}} dict "
+                f"constraining a subset), got {len(values)}"
+            )
+        targets = dict(zip(output_nets, values))
 
     circuit, net_vars = build_cluster_z3_circuit(cluster)
 
     solver = z3.Solver()
     solver.add(circuit)
-    for net, value in zip(output_nets, targets):
+    for net, value in targets.items():
         solver.add(net_vars[net] == bool(value))
 
     input_vars = [net_vars[net] for net in input_nets]
     solutions = []
-    while solver.check() == z3.sat:
+    while (max_solutions is None or len(solutions) < max_solutions) and solver.check() == z3.sat:
         model = solver.model()
         values = tuple(
             int(z3.is_true(model.eval(v, model_completion=True)))
@@ -754,6 +771,65 @@ def build_chip_z3_circuit(chip, clusters):
     return z3.And(*circuits), net_vars, free_nets, chip_output_nets
 
 
+def _solve_chip_targets(circuit, net_vars, free_nets, chip_output_nets, target, output_net, max_solutions=None):
+    """Solving core of find_chip_inputs_for_output(): given an already-
+    built z3 circuit and its (free_nets, chip_output_nets) classification,
+    resolve `target`/`output_net` into a {net: value} constraint dict,
+    validate it against chip_output_nets, then enumerate every free-
+    variable assignment satisfying it. See find_chip_inputs_for_output's
+    own docstring for what `target`/`output_net` accept -- identical
+    here, just factored out of it for readability.
+
+    max_solutions: stop after this many solutions instead of enumerating
+        every one (None, the default, preserves the old unbounded
+        behavior) -- a caller that only constrains ONE net out of many
+        free variables can otherwise face a combinatorially huge (and
+        largely irrelevant) enumeration.
+
+    Returns:
+        (free_nets, solutions) -- see find_chip_inputs_for_output.
+    """
+    if not chip_output_nets:
+        raise ValueError("no net in this chip's combinational logic reads as a chip-level output -- nothing to solve for")
+
+    if isinstance(target, dict):
+        if output_net is not None:
+            raise ValueError("output_net must not be given when target is a dict of {output_net: value} pairs")
+        targets = dict(target)
+        if not targets:
+            raise ValueError("target dict is empty -- nothing to constrain")
+    else:
+        if output_net is None:
+            if len(chip_output_nets) != 1:
+                raise ValueError(
+                    f"chip has {len(chip_output_nets)} combinational output net(s) {chip_output_nets}; "
+                    f"pass output_net explicitly, or target as a dict of {{output_net: value}} pairs"
+                )
+            output_net = chip_output_nets[0]
+        targets = {output_net: target}
+
+    unknown = [net for net in targets if net not in chip_output_nets]
+    if unknown:
+        raise ValueError(f"{unknown!r} not among this chip's own combinational output net(s) {chip_output_nets}")
+
+    solver = z3.Solver()
+    solver.add(circuit)
+    for net, value in targets.items():
+        solver.add(net_vars[net] == bool(value))
+
+    free_vars = [net_vars[net] for net in free_nets]
+    solutions = []
+    while (max_solutions is None or len(solutions) < max_solutions) and solver.check() == z3.sat:
+        model = solver.model()
+        values = tuple(
+            int(z3.is_true(model.eval(v, model_completion=True)))
+            for v in free_vars
+        )
+        solutions.append(values)
+        solver.add(z3.Or([v != z3.BoolVal(bool(val)) for v, val in zip(free_vars, values)]))
+    return free_nets, solutions
+
+
 def find_chip_inputs_for_output(chip, clusters, target, output_net=None):
     """Find every free-variable assignment (chip primary inputs and/or
     sequential-cluster/register state, see build_chip_z3_circuit) that
@@ -788,45 +864,7 @@ def find_chip_inputs_for_output(chip, clusters, target, output_net=None):
         targeted output net matches its own target value.
     """
     circuit, net_vars, free_nets, chip_output_nets = build_chip_z3_circuit(chip, clusters)
-    if not chip_output_nets:
-        raise ValueError("no net in this chip's combinational logic reads as a chip-level output -- nothing to solve for")
-
-    if isinstance(target, dict):
-        if output_net is not None:
-            raise ValueError("output_net must not be given when target is a dict of {output_net: value} pairs")
-        targets = dict(target)
-        if not targets:
-            raise ValueError("target dict is empty -- nothing to constrain")
-    else:
-        if output_net is None:
-            if len(chip_output_nets) != 1:
-                raise ValueError(
-                    f"chip has {len(chip_output_nets)} combinational output net(s) {chip_output_nets}; "
-                    f"pass output_net explicitly, or target as a dict of {{output_net: value}} pairs"
-                )
-            output_net = chip_output_nets[0]
-        targets = {output_net: target}
-
-    unknown = [net for net in targets if net not in chip_output_nets]
-    if unknown:
-        raise ValueError(f"{unknown!r} not among this chip's own combinational output net(s) {chip_output_nets}")
-
-    solver = z3.Solver()
-    solver.add(circuit)
-    for net, value in targets.items():
-        solver.add(net_vars[net] == bool(value))
-
-    free_vars = [net_vars[net] for net in free_nets]
-    solutions = []
-    while solver.check() == z3.sat:
-        model = solver.model()
-        values = tuple(
-            int(z3.is_true(model.eval(v, model_completion=True)))
-            for v in free_vars
-        )
-        solutions.append(values)
-        solver.add(z3.Or([v != z3.BoolVal(bool(val)) for v, val in zip(free_vars, values)]))
-    return free_nets, solutions
+    return _solve_chip_targets(circuit, net_vars, free_nets, chip_output_nets, target, output_net)
 
 
 # ---------------------------------------------------------------------------
