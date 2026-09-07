@@ -1,0 +1,6 @@
+gdstk==1.0.1
+matplotlib==3.11.1
+networkx==3.6.1
+numpy==2.4.6
+PySpice==1.5
+z3-solver==5.1.0.0
